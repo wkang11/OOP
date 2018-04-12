@@ -1,0 +1,6 @@
+c:\users\wkang\documents\visual studio 2015\Projects\DesignParkingLot\DesignParkingLot\bin\Debug\DesignParkingLot.exe.config
+c:\users\wkang\documents\visual studio 2015\Projects\DesignParkingLot\DesignParkingLot\bin\Debug\DesignParkingLot.exe
+c:\users\wkang\documents\visual studio 2015\Projects\DesignParkingLot\DesignParkingLot\bin\Debug\DesignParkingLot.pdb
+c:\users\wkang\documents\visual studio 2015\Projects\DesignParkingLot\DesignParkingLot\obj\Debug\DesignParkingLot.csprojResolveAssemblyReference.cache
+c:\users\wkang\documents\visual studio 2015\Projects\DesignParkingLot\DesignParkingLot\obj\Debug\DesignParkingLot.exe
+c:\users\wkang\documents\visual studio 2015\Projects\DesignParkingLot\DesignParkingLot\obj\Debug\DesignParkingLot.pdb
