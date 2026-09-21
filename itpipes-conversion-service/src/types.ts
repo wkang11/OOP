@@ -1,3 +1,5 @@
+import type { FailureClass } from "./errors.js";
+
 /**
  * Seams between the worker handler and the job store, the queue, and the converters.
  *
@@ -30,34 +32,68 @@ export interface Job {
   leaseExpiresAt?: number;
 }
 
-/** A stored job plus the optimistic-concurrency token the store maintains. */
+/**
+ * A stored job plus the optimistic-concurrency token the store maintains.
+ *
+ * Items written before `version` existed read as version 0, so a service already under load
+ * can adopt conditional writes without stranding its backlog.
+ */
 export interface JobRecord extends Job {
   readonly version: number;
 }
 
+/**
+ * The fields this handler owns. `null` means REMOVE the attribute; an absent field is left
+ * alone. Everything else on the item — the idempotency key, the TTL attribute, anything a
+ * future caller adds — is never touched by a worker.
+ */
+export interface JobUpdate {
+  status: JobStatus;
+  attempt: number;
+  leaseExpiresAt?: number | null;
+  outputKey?: string | null;
+  error?: string | null;
+}
+
 export interface JobStore {
-  get(id: string): Promise<JobRecord | undefined>;
   /**
-   * CHANGED: `put(job)` -> conditional `put(job, expectedVersion)`.
-   *
-   * Resolves with the stored record (version incremented) when `expectedVersion` still matches,
-   * and with `undefined` when it does not, meaning somebody else has written the job since we
-   * read it and our write was rejected. One DynamoDB UpdateItem with
-   * `ConditionExpression: "version = :expected"` and `ReturnValues: ALL_NEW` implements this.
+   * CHANGED: takes a consistency option. The worker's pre-claim read must be strongly
+   * consistent; an eventually consistent read returns a stale `version`, loses the claim, and
+   * turns a normal delivery into a deferral. The API's read-for-polling can stay eventual.
    */
-  put(job: Job, expectedVersion: number): Promise<JobRecord | undefined>;
+  get(id: string, options?: { consistentRead?: boolean }): Promise<JobRecord | undefined>;
+  /**
+   * CHANGED: `put(job)` -> a conditional, partial `update`.
+   *
+   * One DynamoDB `UpdateItem`: `SET` for the fields present, `REMOVE` for the ones set to
+   * `null`, under `ConditionExpression: attribute_not_exists(version) OR version = :expected`
+   * with `ReturnValues: ALL_NEW`. Resolves with the new record, or `undefined` when the
+   * condition failed because somebody else wrote the job since we read it.
+   *
+   * It must be a partial update rather than a whole-item write: a worker that replaces the
+   * item destroys the idempotency-key attribute the API depends on and the TTL attribute that
+   * enforces 90-day retention.
+   */
+  update(id: string, changes: JobUpdate, expectedVersion: number): Promise<JobRecord | undefined>;
 }
 
 export interface QueueMessage {
   jobId: string;
   /**
    * SQS `ApproximateReceiveCount`. Retained for observability and as a poison-pill backstop,
-   * but it is no longer the retry counter: duplicate deliveries inflate it without any work
-   * having been attempted. The retry budget is the stored `Job.attempt`.
+   * but it is no longer the retry counter: duplicate deliveries and deferrals inflate it
+   * without any work having been attempted. The retry budget is the stored `Job.attempt`, and
+   * the queue's `maxReceiveCount` is set well above it.
    */
   receiveCount: number;
   ack(): Promise<void>;
-  retry(): Promise<void>;
+  /**
+   * CHANGED: takes an explicit visibility delay (`ChangeMessageVisibility`). Without it a
+   * released retry cannot come back before the queue's visibility timeout, which for exports
+   * is longer than the alarm that pages on backlog age; and a delivery deferred behind a live
+   * lease comes back early and burns receives.
+   */
+  retry(visibleInSeconds: number): Promise<void>;
 }
 
 export interface RunningConversion {
@@ -115,7 +151,9 @@ export type HandlerEventName =
   | "job.retry_scheduled"
   | "job.deadline_exceeded"
   | "job.kill_failed"
-  | "job.stale_write_discarded";
+  | "job.stale_write_discarded"
+  | "job.unclassified_failure"
+  | "job.handler_error";
 
 export interface HandlerEvent {
   name: HandlerEventName;
@@ -124,14 +162,15 @@ export interface HandlerEvent {
   attempt?: number;
   receiveCount?: number;
   durationMs?: number;
-  classification?: "permanent" | "transient";
+  classification?: FailureClass;
   detail?: string;
 }
 
 /**
  * CHANGED: added. Every branch below is a thing an operator needs a count of; emitting them
  * from the one place that knows the outcome is cheaper than reconstructing it from logs.
- * The deployed implementation writes CloudWatch EMF to stdout.
+ * The deployed implementation writes CloudWatch EMF to stdout, with `kind` and
+ * `classification` as dimensions and everything else as properties (see DESIGN.md §4).
  */
 export interface Telemetry {
   emit(event: HandlerEvent): void;

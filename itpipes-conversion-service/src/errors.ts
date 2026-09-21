@@ -21,13 +21,21 @@ export class ConversionFailedError extends Error {
   }
 }
 
-export type FailureClass = "permanent" | "transient";
+/**
+ * `unclassified` is deliberately not a synonym for `transient`. A failure that arrives with no
+ * exit code means the wrapper could not tell us what happened — usually a bug in the wrapper
+ * rather than a property of the job — and treating it as transient silently spends the whole
+ * retry budget re-running work that will fail the same way. It gets one retry and its own
+ * counter, so a wrapper that stops reporting exit codes shows up as a metric instead of as a
+ * tripled bill.
+ */
+export type FailureClass = "permanent" | "transient" | "unclassified";
 
 /**
  * Exit codes that mean "this input will never convert, no matter how many times we try".
- * Exit 2 is the vendor writer's "required table missing". Everything else, including 137
- * (128 + SIGKILL, i.e. the cgroup OOM killer) and an expired deadline, is treated as
- * transient: retrying is the cheaper mistake when the alternative is failing a valid job.
+ * Exit 2 is the vendor writer's "required table missing". 137 (128 + SIGKILL, i.e. the cgroup
+ * OOM killer) and an expired deadline are transient: retrying is the cheaper mistake when the
+ * alternative is failing a valid job.
  */
 const PERMANENT_EXIT_CODES: ReadonlySet<number> = new Set([2]);
 
@@ -44,7 +52,7 @@ export function classifyFailure(error: unknown): FailureClass {
   if (typeof exitCode === "number") {
     return PERMANENT_EXIT_CODES.has(exitCode) ? "permanent" : "transient";
   }
-  return "transient";
+  return "unclassified";
 }
 
 const MAX_ERROR_CHARS = 1024;

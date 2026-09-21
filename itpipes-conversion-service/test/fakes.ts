@@ -6,15 +6,17 @@
  */
 
 import { ConversionFailedError, DeadlineExceededError } from "../src/errors.js";
+import { defaultConfig } from "../src/index.js";
 import type {
   Clock,
   Converter,
   Deadline,
+  HandlerConfig,
   HandlerEvent,
   Job,
-  JobKind,
   JobRecord,
   JobStore,
+  JobUpdate,
   QueueMessage,
   RunningConversion,
   Telemetry,
@@ -25,48 +27,84 @@ import type {
   JobStore as LegacyJobStore,
 } from "../src/legacy/original-handler.js";
 
+/** A stored item: the job attributes plus whatever else the API or TTL put on the row. */
+type StoredItem = Partial<Job> & { id: string; version?: number } & Record<string, unknown>;
+
+export interface SeedOptions {
+  /** Omit `version`, as rows written before conditional writes existed would be. */
+  unversioned?: boolean;
+  /** Extra attributes the handler knows nothing about and must not destroy. */
+  attributes?: Record<string, unknown>;
+}
+
+/**
+ * Models one DynamoDB table: partial updates under a version condition, `null` meaning
+ * REMOVE, a missing `version` reading as 0, and attributes outside `Job` left alone.
+ */
 export class InMemoryJobStore implements JobStore {
-  private readonly jobs = new Map<string, JobRecord>();
+  private readonly items = new Map<string, StoredItem>();
   readonly writes: JobRecord[] = [];
+  readonly reads: Array<{ id: string; consistentRead: boolean }> = [];
   conflicts = 0;
+  /** Test hook: model a throttled or failed conditional write. */
+  failUpdate: ((changes: JobUpdate) => Error | undefined) | undefined;
 
-  constructor(...seed: Array<Partial<Job> & { id: string }>) {
-    for (const job of seed) this.seed(job);
-  }
-
-  seed(job: Partial<Job> & { id: string }): JobRecord {
-    const record: JobRecord = {
+  seed(job: Partial<Job> & { id: string }, options: SeedOptions = {}): JobRecord {
+    const item: StoredItem = {
       kind: "import",
       inputKey: `uploads/${job.id}.mdb`,
       status: "queued",
       attempt: 0,
+      ...options.attributes,
       ...job,
-      version: 1,
+      ...(options.unversioned ? {} : { version: 1 }),
     };
-    this.jobs.set(record.id, record);
-    return record;
+    this.items.set(item.id, item);
+    return this.materialize(item);
   }
 
-  async get(id: string): Promise<JobRecord | undefined> {
-    const record = this.jobs.get(id);
-    return record ? { ...record } : undefined;
+  async get(id: string, options?: { consistentRead?: boolean }): Promise<JobRecord | undefined> {
+    this.reads.push({ id, consistentRead: options?.consistentRead === true });
+    const item = this.items.get(id);
+    return item ? this.materialize(item) : undefined;
   }
 
-  async put(job: Job, expectedVersion: number): Promise<JobRecord | undefined> {
-    const current = this.jobs.get(job.id);
-    if (!current || current.version !== expectedVersion) {
+  async update(
+    id: string,
+    changes: JobUpdate,
+    expectedVersion: number,
+  ): Promise<JobRecord | undefined> {
+    const failure = this.failUpdate?.(changes);
+    if (failure) throw failure;
+    const current = this.items.get(id);
+    if (!current || (current.version ?? 0) !== expectedVersion) {
       this.conflicts += 1;
       return undefined;
     }
-    const record: JobRecord = { ...job, version: current.version + 1 };
-    this.jobs.set(job.id, record);
+    const next: StoredItem = { ...current, version: (current.version ?? 0) + 1 };
+    for (const [key, value] of Object.entries(changes)) {
+      if (value === null) delete next[key];
+      else if (value !== undefined) next[key] = value;
+    }
+    this.items.set(id, next);
+    const record = this.materialize(next);
     this.writes.push(record);
-    return { ...record };
+    return record;
+  }
+
+  /** The raw item, including attributes outside the `Job` shape. */
+  raw(id: string): StoredItem | undefined {
+    const item = this.items.get(id);
+    return item ? { ...item } : undefined;
   }
 
   snapshot(id: string): JobRecord | undefined {
-    const record = this.jobs.get(id);
-    return record ? { ...record } : undefined;
+    const item = this.items.get(id);
+    return item ? this.materialize(item) : undefined;
+  }
+
+  private materialize(item: StoredItem): JobRecord {
+    return { ...item, version: item.version ?? 0 } as JobRecord;
   }
 
   /** The starter store: unconditional whole-object writes, no version. */
@@ -74,14 +112,10 @@ export class InMemoryJobStore implements JobStore {
     return {
       get: async (id: string): Promise<LegacyJob | undefined> => this.snapshot(id),
       put: async (job: LegacyJob): Promise<void> => {
-        const current = this.jobs.get(job.id);
-        const record = {
-          ...(current ?? {}),
-          ...(job as Job),
-          version: (current?.version ?? 0) + 1,
-        } as JobRecord;
-        this.jobs.set(job.id, record);
-        this.writes.push(record);
+        const current = this.items.get(job.id);
+        const item = { ...(job as StoredItem), version: (current?.version ?? 0) + 1 };
+        this.items.set(job.id, item);
+        this.writes.push(this.materialize(item));
       },
     };
   }
@@ -90,6 +124,8 @@ export class InMemoryJobStore implements JobStore {
 export class FakeQueueMessage implements QueueMessage {
   acks = 0;
   retries = 0;
+  /** The visibility delay requested on each retry, in seconds. */
+  readonly retryDelays: number[] = [];
 
   constructor(
     readonly jobId: string,
@@ -100,8 +136,9 @@ export class FakeQueueMessage implements QueueMessage {
     this.acks += 1;
   }
 
-  async retry(): Promise<void> {
+  async retry(visibleInSeconds = 0): Promise<void> {
     this.retries += 1;
+    this.retryDelays.push(visibleInSeconds);
   }
 }
 
@@ -110,6 +147,8 @@ export class FakeConversion implements RunningConversion {
   killCount = 0;
   /** True until the child exits, however it exits. Mirrors a live OS process. */
   alive = true;
+  /** Set when the completion promise settles, so a test can prove a late rejection happened. */
+  settled: "resolved" | "rejected" | undefined;
 
   private resolve!: () => void;
   private reject!: (error: unknown) => void;
@@ -119,6 +158,14 @@ export class FakeConversion implements RunningConversion {
       this.resolve = resolve;
       this.reject = reject;
     });
+    void this.completion.then(
+      () => {
+        this.settled = "resolved";
+      },
+      () => {
+        this.settled = "rejected";
+      },
+    );
   }
 
   finish(): void {
@@ -131,6 +178,13 @@ export class FakeConversion implements RunningConversion {
     if (!this.alive) return;
     this.alive = false;
     this.reject(new ConversionFailedError(exitCode, message));
+  }
+
+  /** A crash the wrapper could not attach an exit code to. */
+  failUnclassified(message = "wrapper lost the exit code"): void {
+    if (!this.alive) return;
+    this.alive = false;
+    this.reject(new Error(message));
   }
 
   async kill(): Promise<void> {
@@ -147,8 +201,11 @@ export class FakeConversion implements RunningConversion {
 export class FakeConverter implements Converter {
   readonly started: Array<{ inputKey: string; outputKey: string }> = [];
   readonly conversions: FakeConversion[] = [];
+  /** When set, `start` throws — a converter that will not launch. */
+  failToStart: Error | undefined;
 
   start(inputKey: string, outputKey: string): RunningConversion {
+    if (this.failToStart) throw this.failToStart;
     this.started.push({ inputKey, outputKey });
     const conversion = new FakeConversion();
     this.conversions.push(conversion);
@@ -243,6 +300,10 @@ export class RecordingTelemetry implements Telemetry {
   count(name: string): number {
     return this.events.filter((event) => event.name === name).length;
   }
+
+  find(name: string): HandlerEvent | undefined {
+    return this.events.find((event) => event.name === name);
+  }
 }
 
 /** Let queued microtasks run, so awaited handler steps can make progress. */
@@ -250,15 +311,7 @@ export async function flush(times = 8): Promise<void> {
   for (let i = 0; i < times; i += 1) await Promise.resolve();
 }
 
-export function config(overrides: Partial<{
-  deadlineMs: Record<JobKind, number>;
-  maxAttempts: number;
-  leaseGraceMs: number;
-}> = {}) {
-  return {
-    deadlineMs: { import: 15 * 60_000, export: 120 * 60_000 },
-    maxAttempts: 3,
-    leaseGraceMs: 60_000,
-    ...overrides,
-  };
+/** The shipped configuration, so tests exercise the values that actually deploy. */
+export function config(overrides: Partial<HandlerConfig> = {}): HandlerConfig {
+  return { ...defaultConfig, ...overrides };
 }

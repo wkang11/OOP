@@ -54,14 +54,13 @@ it("BUG: a slow attempt overwrites a newer attempt's published result", async ()
   await flush();
 
   const claimed = store.snapshot("job-3")!;
-  await store.put(
+  await store.update(
+    "job-3",
     {
-      id: "job-3",
-      kind: "export",
-      inputKey: claimed.inputKey,
       status: "succeeded",
       attempt: 2,
-      outputKey: "jobs/job-3/attempts/2/result.json",
+      outputKey: "exports/job-3/attempts/2/package.zip",
+      leaseExpiresAt: null,
     },
     claimed.version,
   );

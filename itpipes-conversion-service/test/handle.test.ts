@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { handle } from "../src/handle.js";
 import { defaultConfig } from "../src/index.js";
-import type { HandlerDeps } from "../src/types.js";
+import type { HandlerConfig, HandlerDeps } from "../src/types.js";
 import {
   config,
   FakeConverter,
@@ -13,7 +13,7 @@ import {
   RecordingTelemetry,
 } from "./fakes.js";
 
-function harness(overrides: Partial<ReturnType<typeof config>> = {}) {
+function harness(overrides: Partial<HandlerConfig> = {}) {
   const store = new InMemoryJobStore();
   const converter = new FakeConverter();
   const clock = new ManualClock();
@@ -49,10 +49,23 @@ describe("single-writer discipline", () => {
     const job = store.snapshot("job-1");
     expect(job?.status).toBe("succeeded");
     expect(job?.attempt).toBe(1);
-    expect(job?.outputKey).toBe("jobs/job-1/attempts/1/result.json");
+    expect(job?.outputKey).toBe("exports/job-1/attempts/1/package.zip");
   });
 
-  it("defers a delivery while another worker holds a live lease", async () => {
+  it("reads the record strongly consistently before claiming", async () => {
+    const { store, converter, deps } = harness();
+    store.seed({ id: "job-1b" });
+    const running = handle(new FakeQueueMessage("job-1b"), deps);
+    await flush();
+    converter.last().finish();
+    await running;
+
+    // An eventually consistent read returns a stale version, loses the claim, and turns an
+    // ordinary delivery into a deferral.
+    expect(store.reads[0]).toEqual({ id: "job-1b", consistentRead: true });
+  });
+
+  it("defers a delivery for exactly as long as the live lease has left", async () => {
     const { store, converter, clock, telemetry, deps } = harness();
     store.seed({ id: "job-2", status: "running", attempt: 1, leaseExpiresAt: 5_000 });
 
@@ -61,6 +74,8 @@ describe("single-writer discipline", () => {
 
     expect(converter.started).toHaveLength(0);
     expect(message.retries).toBe(1);
+    // Coming back before the lease expires would burn a receive for nothing.
+    expect(message.retryDelays).toEqual([5]);
     expect(message.acks).toBe(0);
     expect(telemetry.count("job.lease_held")).toBe(1);
 
@@ -88,14 +103,13 @@ describe("single-writer discipline", () => {
     // While this attempt is still converting, another worker (or the sweeper) moves the job on.
     const claimed = store.snapshot("job-3")!;
     expect(claimed.version).toBe(seeded.version + 1);
-    await store.put(
+    await store.update(
+      "job-3",
       {
-        id: "job-3",
-        kind: "export",
-        inputKey: claimed.inputKey,
         status: "succeeded",
         attempt: 2,
-        outputKey: "jobs/job-3/attempts/2/result.json",
+        outputKey: "exports/job-3/attempts/2/package.zip",
+        leaseExpiresAt: null,
       },
       claimed.version,
     );
@@ -105,10 +119,47 @@ describe("single-writer discipline", () => {
 
     const job = store.snapshot("job-3");
     expect(job?.attempt).toBe(2);
-    expect(job?.outputKey).toBe("jobs/job-3/attempts/2/result.json");
+    expect(job?.outputKey).toBe("exports/job-3/attempts/2/package.zip");
     expect(telemetry.count("job.stale_write_discarded")).toBe(1);
     // The message is still removed: the job has an owner and a result, so redelivery is waste.
     expect(message.acks).toBe(1);
+  });
+
+  it("preserves attributes the worker does not own", async () => {
+    const { store, converter, deps } = harness();
+    store.seed(
+      { id: "job-3b" },
+      { attributes: { idempotencyKey: "caller-key-1", expiresAt: 1_900_000_000 } },
+    );
+
+    const running = handle(new FakeQueueMessage("job-3b"), deps);
+    await flush();
+    converter.last().finish();
+    await running;
+
+    // A whole-item write would take the idempotency key and the TTL attribute with it, so
+    // re-submission would double-enqueue and job metadata would never expire.
+    const raw = store.raw("job-3b")!;
+    expect(raw.idempotencyKey).toBe("caller-key-1");
+    expect(raw.expiresAt).toBe(1_900_000_000);
+    expect(raw.status).toBe("succeeded");
+    expect(raw.leaseExpiresAt).toBeUndefined();
+  });
+
+  it("claims a record written before the version attribute existed", async () => {
+    const { store, converter, deps } = harness();
+    store.seed({ id: "job-3c", kind: "import" }, { unversioned: true });
+
+    const running = handle(new FakeQueueMessage("job-3c"), deps);
+    await flush();
+    // Rows from before this change read as version 0 and must still be claimable, or the
+    // existing backlog can never be worked.
+    expect(converter.started).toHaveLength(1);
+    converter.last().finish();
+    await running;
+
+    expect(store.snapshot("job-3c")?.status).toBe("succeeded");
+    expect(store.snapshot("job-3c")?.version).toBe(2);
   });
 });
 
@@ -143,6 +194,10 @@ describe("deadlines", () => {
     await flush();
     const conversion = converter.last();
     expect(conversion.alive).toBe(true);
+    // The lease covers the deadline plus the shipped grace, so a peer defers for the whole run.
+    expect(store.snapshot("job-4")?.leaseExpiresAt).toBe(
+      defaultConfig.deadlineMs.import + defaultConfig.leaseGraceMs,
+    );
 
     await clock.advance(defaultConfig.deadlineMs.import + 1);
     await running;
@@ -155,6 +210,7 @@ describe("deadlines", () => {
     expect(store.snapshot("job-4")?.attempt).toBe(1);
     expect(store.snapshot("job-4")?.leaseExpiresAt).toBeUndefined();
     expect(message.retries).toBe(1);
+    expect(message.retryDelays).toEqual([0]);
   });
 
   it("cancels the deadline timer when the conversion finishes first", async () => {
@@ -173,17 +229,22 @@ describe("deadlines", () => {
     const unhandled: unknown[] = [];
     const onUnhandled = (reason: unknown) => unhandled.push(reason);
     process.on("unhandledRejection", onUnhandled);
+    let conversion;
     try {
-      const { store, clock, deps } = harness();
+      const { store, converter, clock, deps } = harness();
       store.seed({ id: "job-6" });
       const running = handle(new FakeQueueMessage("job-6"), deps);
       await flush();
+      conversion = converter.last();
       await clock.advance(defaultConfig.deadlineMs.import + 1);
       await running;
       await new Promise((resolve) => setTimeout(resolve, 20));
     } finally {
       process.off("unhandledRejection", onUnhandled);
     }
+    // Positive control: the late rejection has to have actually happened, or this test would
+    // pass just as well against a conversion that never settles.
+    expect(conversion?.settled).toBe("rejected");
     expect(unhandled).toEqual([]);
   });
 });
@@ -207,12 +268,10 @@ describe("failure classification and the retry budget", () => {
     expect(message.retries).toBe(0);
     expect(message.acks).toBe(1);
     expect(converter.started).toHaveLength(1);
-    expect(telemetry.events.find((e) => e.name === "job.failed")?.classification).toBe(
-      "permanent",
-    );
+    expect(telemetry.find("job.failed")?.classification).toBe("permanent");
   });
 
-  it("retries a transient converter error and leaves the job claimable", async () => {
+  it("retries a transient converter error immediately and leaves the job claimable", async () => {
     const { store, converter, deps } = harness();
     store.seed({ id: "job-8" });
 
@@ -225,7 +284,11 @@ describe("failure classification and the retry budget", () => {
     const job = store.snapshot("job-8");
     expect(job?.status).toBe("queued");
     expect(job?.attempt).toBe(1);
+    expect(job?.leaseExpiresAt).toBeUndefined();
     expect(message.retries).toBe(1);
+    // Without the explicit zero the retry waits out the visibility timeout — 125 minutes for
+    // an export, which trips the backlog-age alarm on an ordinary retry.
+    expect(message.retryDelays).toEqual([0]);
     expect(message.acks).toBe(0);
   });
 
@@ -233,7 +296,7 @@ describe("failure classification and the retry budget", () => {
     const { store, converter, deps } = harness();
     store.seed({ id: "job-9", attempt: 0 });
 
-    // Three deliveries have happened, but no conversion has been attempted yet.
+    // Five deliveries have happened, but no conversion has been attempted yet.
     const message = new FakeQueueMessage("job-9", 5);
     const running = handle(message, deps);
     await flush();
@@ -258,6 +321,69 @@ describe("failure classification and the retry budget", () => {
     expect(job?.status).toBe("failed");
     expect(job?.attempt).toBe(3);
     expect(message.acks).toBe(1);
+  });
+
+  it("gives an unclassified failure one retry, not the whole budget", async () => {
+    const first = harness();
+    first.store.seed({ id: "job-10b", attempt: 0 });
+    const firstMessage = new FakeQueueMessage("job-10b");
+    const firstRun = handle(firstMessage, first.deps);
+    await flush();
+    first.converter.last().failUnclassified();
+    await firstRun;
+
+    expect(first.store.snapshot("job-10b")?.status).toBe("queued");
+    expect(first.telemetry.count("job.unclassified_failure")).toBe(1);
+
+    // A wrapper that has stopped reporting exit codes must not turn every permanent failure
+    // into a full budget of re-runs, so the second unclassified failure is terminal.
+    const second = harness();
+    second.store.seed({ id: "job-10c", attempt: 1 });
+    const secondMessage = new FakeQueueMessage("job-10c");
+    const secondRun = handle(secondMessage, second.deps);
+    await flush();
+    second.converter.last().failUnclassified();
+    await secondRun;
+
+    expect(second.store.snapshot("job-10c")?.status).toBe("failed");
+    expect(second.store.snapshot("job-10c")?.attempt).toBe(2);
+    expect(secondMessage.acks).toBe(1);
+  });
+});
+
+describe("a seam that throws", () => {
+  it("does not strand the job under a live lease when a store write fails", async () => {
+    const { store, converter, telemetry, deps } = harness();
+    store.seed({ id: "job-11" });
+    store.failUpdate = (changes) =>
+      changes.status === "succeeded" ? new Error("ProvisionedThroughputExceeded") : undefined;
+
+    const message = new FakeQueueMessage("job-11");
+    const running = handle(message, deps);
+    await flush();
+    converter.last().finish();
+    await expect(running).resolves.toBeUndefined();
+
+    const job = store.snapshot("job-11");
+    expect(telemetry.count("job.handler_error")).toBe(1);
+    expect(job?.status).toBe("queued");
+    expect(job?.leaseExpiresAt).toBeUndefined();
+    expect(message.retries).toBe(1);
+    expect(message.acks).toBe(0);
+  });
+
+  it("releases the lease when the converter will not start", async () => {
+    const { store, converter, telemetry, deps } = harness();
+    store.seed({ id: "job-12", kind: "export" });
+    converter.failToStart = new Error("spawn EAGAIN");
+
+    const message = new FakeQueueMessage("job-12");
+    await expect(handle(message, deps)).resolves.toBeUndefined();
+
+    expect(telemetry.count("job.handler_error")).toBe(1);
+    expect(store.snapshot("job-12")?.status).toBe("queued");
+    expect(store.snapshot("job-12")?.leaseExpiresAt).toBeUndefined();
+    expect(message.retries).toBe(1);
   });
 });
 
