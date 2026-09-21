@@ -1,6 +1,7 @@
 # ITpipes legacy file conversion service — platform homework
 
 - **[DESIGN.md](./DESIGN.md)** — the design review (risks, smallest v1 changes, job lifecycle, operations/deployment/observability, sizing and cost).
+- **[APPENDIX.md](./APPENDIX.md)** — supporting detail for the review: cost table and rates, the slot-formula derivation, quota and ENI capacity planning, the extended failure and DR walkthrough, and the fourth operational signal.
 - **[NOTES.md](./NOTES.md)** — assumptions, what I did not fix and why, where I stopped, and how AI was used.
 - `src/` — the revised worker handler and its interfaces.
 - `src/legacy/original-handler.ts` — the starter worker, verbatim, kept so the tests can run against it.
