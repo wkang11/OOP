@@ -105,8 +105,8 @@ export async function handle(message: QueueMessage, deps: HandlerDeps): Promise<
 
   const conversion = converter.start(record.inputKey, outputKey);
   // The child may reject after the deadline has already decided the outcome. Observing the
-  // promise here keeps that late rejection from reaching `unhandledRejection` and taking down
-  // a task that is still working on nine other messages.
+  // promise here keeps that late rejection off `unhandledRejection`, which would take down a
+  // task that is still converting other messages.
   void conversion.completion.catch(() => {});
 
   const deadline = clock.timeout(deadlineMs);
@@ -130,12 +130,10 @@ export async function handle(message: QueueMessage, deps: HandlerDeps): Promise<
         detail: `deadlineMs=${deadlineMs}`,
       });
     }
-    // The original returned straight to `message.retry()` here. A timed-out vendor subprocess
-    // keeps running unless its owner terminates and reaps it, so the redelivery started a
-    // second conversion beside the first, each holding ~2 GB, which is how a task gets
-    // OOM-killed (exit 137). Terminate before the message becomes visible again. This also
-    // covers a converter that rejects but leaves the child alive; kill is a no-op if it
-    // already exited.
+    // A timed-out subprocess keeps running unless its owner terminates and reaps it. It must
+    // be gone before the message becomes visible again, or the redelivery converts alongside
+    // it and the two ~2 GB children OOM the task (exit 137). Also covers a converter that
+    // rejects while leaving its child alive; kill is a no-op once the child has exited.
     try {
       await conversion.kill();
     } catch (killError) {
