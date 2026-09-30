@@ -1,0 +1,24 @@
+---
+title: "4. Job record lifecycle — every path terminates"
+---
+stateDiagram-v2
+  direction LR
+  [*] --> queued: conditional create
+
+  queued --> running: conditional claim on version
+  running --> succeeded: object, then terminal write
+  running --> failed: exit 2, permanent
+  running --> failed: budget of 3 exhausted
+  running --> queued: exit 137 or deadline, lease released
+  running --> queued: worker died, lease expires
+  queued --> failed: sweeper, stale lease
+  queued --> failed: DLQ drained
+
+  succeeded --> [*]: webhook
+  failed --> [*]: webhook
+
+  note right of running
+    Two counters, not one:
+    stored attempt is the budget,
+    receiveCount is the backstop.
+  end note

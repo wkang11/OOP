@@ -1,0 +1,41 @@
+---
+title: "5. The handler's real branches — every leaf says what happens to the message"
+---
+flowchart TB
+  A(["message received"]) --> B{"record exists?"}
+  B -- no --> B1["<b>ack</b><br/>job.unknown_id"]
+  B -- yes --> C{"already terminal?"}
+  C -- yes --> C1["<b>ack</b><br/>job.already_terminal"]
+  C -- no --> D{"lease still live?"}
+  D -- yes --> D1["<b>retry, delayed to lease expiry</b><br/>job.lease_held<br/><i>the duplicate-delivery path</i>"]
+  D -- no --> E{"attempt + 1 over<br/>the budget of 3?"}
+  E -- yes --> E1["<b>write failed, ack</b><br/>backstop"]
+  E -- no --> F["conditional claim<br/>on <b>version</b>"]
+  F --> G{"claim held?"}
+  G -- no --> G1["<b>retry</b><br/>job.claim_conflict"]
+  G -- yes --> H["convert under the<br/>per-kind deadline"]
+  H --> I{"how did it end?"}
+
+  I -- completed --> J["object first,<br/>then terminal write"]
+  J --> K{"terminal write held?"}
+  K -- yes --> K1["<b>ack</b><br/>job.succeeded"]
+  K -- no --> K2["<b>ack</b><br/>job.stale_write_discarded<br/><i>newer attempt already published</i>"]
+
+  I -- "deadline expired" --> L["<b>kill AND reap</b><br/>job.deadline_exceeded<br/><i>skipping the reap is the original bug</i>"]
+  I -- "converter failed" --> M{"classify<br/>the exit code"}
+  L --> M
+
+  M -- "exit 2 · permanent" --> N1["<b>failed on attempt 1, ack</b><br/>a missing table never converts"]
+  M -- "exit 137 · transient" --> N2["<b>release lease, visibility 0, retry now</b><br/>otherwise it waits 125 min"]
+  M -- "no exit code" --> N3["<b>one retry, own counter</b><br/>job.unclassified_failure"]
+
+  X(["any seam throws"]) --> X1["<b>top-level guard</b><br/>kill the child, release the lease, rethrow"]
+
+  classDef ack fill:#d5f2da,stroke:#1d6b2a,stroke-width:3px,color:#0b1b33
+  classDef retry fill:#ffe9a8,stroke:#a06a00,stroke-width:3px,color:#0b1b33
+  classDef bad fill:#ffdada,stroke:#b02020,stroke-width:3px,color:#0b1b33
+  classDef q fill:#e6eeff,stroke:#2f4b7c,stroke-width:2px,color:#0b1b33
+  class B1,C1,K1 ack
+  class D1,G1,N2,N3 retry
+  class E1,K2,L,N1,X1 bad
+  class B,C,D,E,G,I,K,M q

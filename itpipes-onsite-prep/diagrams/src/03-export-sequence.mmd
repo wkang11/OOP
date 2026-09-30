@@ -1,0 +1,36 @@
+---
+title: "3. An export — same control flow, different economics"
+---
+sequenceDiagram
+  autonumber
+  participant Q as exports queue
+  participant W as Export worker<br/>1 slot per task
+  participant E as ECS agent
+  participant J as Vendor JVM<br/>subprocess
+  participant D as DynamoDB
+  participant S as S3
+
+  Q->>W: ReceiveMessage { jobId } — visibility timeout 125 min
+  W->>E: UpdateTaskProtection — held for the whole job
+  Note over W,E: stopTimeout caps at 120 s on Fargate, so a 40-minute<br/>export can never drain gracefully. Task protection is<br/>what stops a deploy or a scale-in event from killing it.
+
+  W->>D: ConsistentRead, then conditional claim<br/>lease = 120-min deadline + grace
+  D-->>W: claim won
+
+  W->>J: spawn, under the 120-minute deadline
+  loop every 60 s while converting
+    W->>Q: ChangeMessageVisibility — extend the lease on the message
+  end
+  Note over W,J: One slot per task because DISK BINDS BEFORE MEMORY:<br/>a 40 GB package needs ~100 GiB of scratch<br/>against the 200 GiB attached.
+  J-->>W: exit code 0 — the wrapper surfaces it so failures can be classified
+
+  rect rgb(213, 242, 218)
+    W->>S: multipart upload exports/{id}/attempts/{n}/package.zip — 10–40 GB
+    S-->>W: upload complete
+    W->>D: conditional write status=succeeded, condition on version
+    D-->>W: committed
+  end
+
+  W->>Q: DeleteMessage — ack
+  W->>E: release task protection
+  Note over W,E: If the task had died instead, the lease expires,<br/>the message reappears, and attempt n+1 restarts<br/>from scratch — exports are deliberately not resumable in v1.

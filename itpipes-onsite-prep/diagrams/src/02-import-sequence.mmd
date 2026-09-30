@@ -1,0 +1,39 @@
+---
+title: "2. An import, end to end — one successful attempt"
+---
+sequenceDiagram
+  autonumber
+  participant C as Caller service
+  participant API as API + Lambda
+  participant D as DynamoDB
+  participant Q as imports queue
+  participant W as Import worker
+  participant S as S3
+
+  C->>API: POST /jobs — kind, inputKey, idempotencyKey
+  API->>D: conditional PutItem keyed by idempotency key<br/>status=queued, attempt=0, version=1
+  Note over API,D: Deliberately not a GSI lookup: index reads are never<br/>strongly consistent, so two concurrent submissions<br/>with one key would both miss and create two jobs
+  D-->>API: condition passed — the job exists exactly once
+  API->>Q: SendMessage carrying only { jobId }
+  API-->>C: 202 Accepted + jobId
+
+  Q->>W: ReceiveMessage { jobId }
+  W->>D: GetItem with ConsistentRead
+  D-->>W: status=queued, version=v
+  W->>D: UpdateItem status=running, attempt=n+1, lease<br/>condition: version = v
+  D-->>W: claim won — version = v+1
+  Note over W: If that condition had failed, another worker owns<br/>the job and this one returns its message<br/>without converting. That is duplicate delivery, solved.
+
+  W->>W: convert in-process, under the 15-minute deadline
+
+  Note over W,S: OBJECT FIRST, RECORD SECOND — the record can<br/>never advertise bytes that do not exist
+  rect rgb(213, 242, 218)
+    W->>S: PutObject imports/{id}/attempts/{n}/result.json
+    S-->>W: durable — and immutable, because the key is per attempt
+    W->>D: UpdateItem status=succeeded, outputKey<br/>condition: version = v+1
+    D-->>W: committed — the single atomic moment a result becomes THE result
+  end
+
+  W->>Q: DeleteMessage — ack
+  C->>API: GET /jobs/{id}
+  API-->>C: succeeded + outputKey — or the webhook fires off the same transition

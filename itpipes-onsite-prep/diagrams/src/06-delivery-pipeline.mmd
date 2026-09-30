@@ -1,0 +1,41 @@
+---
+title: "6. How a change reaches production — and the two ways back"
+---
+flowchart TB
+  subgraph PIPE["Pipeline"]
+    direction LR
+    PR(["pull request"]) --> CI["<b>PR checks</b><br/>tsc · vitest · cdk diff"]
+    CI --> BUILD["<b>one image</b><br/>tagged by commit SHA<br/>scanned, pushed to ECR"]
+    BUILD --> STAGE["<b>staging</b><br/>same digest"]
+    STAGE --> CANARY{"<b>canary gate</b><br/>1 import + 1 export<br/>every 5 min"}
+    CANARY -- red --> BLOCK["<b>promotion blocked</b>"]
+    CANARY -- green --> PROD["<b>rolling prod deploy</b><br/>one fleet at a time<br/><b>imports first</b>"]
+  end
+
+  PROD --> WATCH{"<b>is the release bad?</b><br/>canary red · transient-failure rate by image tag · task starts failing"}
+
+  WATCH -- no --> DONE(["release complete"])
+
+  subgraph LEV["Two different levers — the brief asks for both"]
+    direction LR
+    STOP["<b>STOP</b><br/>desired count to zero<br/>safe because the queue holds the work,<br/>so it costs latency only"]
+    REV["<b>REVERSE</b><br/>previous task definition revision<br/>automatic via ECS deployment alarms"]
+  end
+
+  WATCH -- yes --> LEV
+
+  N1["<b>Circuit breaker alone is not enough:</b> it only catches tasks that fail to <i>start</i>.<br/>A task that starts cleanly and fails every job never trips it."]
+  N2["<b>Export caveat:</b> a rolling deploy waits on scale-in-protected tasks.<br/>Budget two hours, and say so before an incident discovers it."]
+  LEV -.-> N1
+  PROD -.-> N2
+
+  classDef gate fill:#e6eeff,stroke:#2f4b7c,stroke-width:3px,color:#0b1b33
+  classDef good fill:#d5f2da,stroke:#1d6b2a,stroke-width:3px,color:#0b1b33
+  classDef bad fill:#ffdada,stroke:#b02020,stroke-width:3px,color:#0b1b33
+  classDef lever fill:#ffe9a8,stroke:#a06a00,stroke-width:4px,color:#0b1b33
+  classDef note fill:#f4f4f4,stroke:#888,stroke-width:1px,color:#0b1b33
+  class CANARY,WATCH gate
+  class DONE good
+  class BLOCK bad
+  class STOP,REV lever
+  class N1,N2 note

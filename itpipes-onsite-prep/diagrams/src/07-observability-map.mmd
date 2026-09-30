@@ -1,0 +1,38 @@
+---
+title: "7. Who emits what, and which alarm it feeds"
+---
+flowchart TB
+  subgraph EMIT["Where the signal comes from"]
+    direction LR
+    SQS["<b>SQS</b><br/>free, per queue"]
+    HAND["<b>The worker handler</b><br/>CloudWatch EMF on stdout"]
+    S3M["<b>S3</b><br/>daily storage metrics"]
+    LAM["<b>Sweeper + webhook Lambdas</b><br/>and the stream mapping"]
+    CAN["<b>Canary</b><br/>one import + one export, every 5 min"]
+  end
+
+  A1["<b>1 · Backlog is not draining</b><br/>ApproximateAgeOfOldestMessage, per queue<br/>imports over 10 min for 5 min<br/>exports over 60 min for 10 min<br/><b>PAGE</b> → desired vs running tasks:<br/>usually the vCPU quota or subnet IPs,<br/>not code"]
+  A2["<b>2 · Failures that are ours, not the customer's</b><br/>job.failed by classification and kind<br/>transient over 5% of terminal jobs in 15 min<br/><b>PAGE</b> → split by image tag against the last<br/>deploy, roll back if correlated<br/><i>a customer's broken .mdb never pages anyone</i>"]
+  A3["<b>3 · Paying to do the same work twice</b><br/>deadline_exceeded · lease_held · claim_conflict<br/>stale_write_discarded · unclassified_failure<br/>any deadline over ~1/hour per kind<br/><b>TICKET</b> → early warning for the OOM and<br/>duplicate-export spirals before they bite"]
+  A4["<b>4 · The bill is 90% one line</b><br/>BucketSizeBytes <b>per prefix</b>, daily<br/>export prefix over ~70 TB, or the import<br/>prefix still growing after day 90<br/><b>TICKET</b> → a lifecycle rule that silently stops<br/>matching is invisible in every other signal:<br/>the difference between $2,600 and $9,600"]
+  A5["<b>5 · Nothing reaches a dead end unnoticed</b><br/>DLQ depth · sweeper Errors + Invocations==0<br/>dead-man · IteratorAge on the stream mapping ·<br/>canary with TreatMissingData: breaching<br/><b>PAGE</b> → these watch the parts that make<br/>the guarantees true"]
+
+  SQS --> A1
+  SQS --> A5
+  HAND --> A2
+  HAND --> A3
+  S3M --> A4
+  LAM --> A5
+  CAN --> A5
+
+  EMF["<b>EMF discipline — a cost decision, not a style one</b><br/><br/><b>Dimensions:</b> kind, classification — and nothing else.<br/>Every unique dimension set is a separately billed custom metric.<br/><br/><b>Properties:</b> jobId, attempt, image tag.<br/>Free, and still queryable in Logs Insights.<br/><br/>jobId as a dimension would be ~1,000 new metrics a day;<br/>image tag would multiply the set on every deploy and never shrink."]
+  HAND -.-> EMF
+
+  classDef src fill:#e6eeff,stroke:#2f4b7c,stroke-width:3px,color:#0b1b33
+  classDef page fill:#ffdada,stroke:#b02020,stroke-width:3px,color:#0b1b33
+  classDef ticket fill:#ffe9a8,stroke:#a06a00,stroke-width:3px,color:#0b1b33
+  classDef note fill:#d5f2da,stroke:#1d6b2a,stroke-width:3px,color:#0b1b33
+  class SQS,HAND,S3M,LAM,CAN src
+  class A1,A2,A5 page
+  class A3,A4 ticket
+  class EMF note

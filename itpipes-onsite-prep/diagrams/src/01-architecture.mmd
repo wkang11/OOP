@@ -1,0 +1,64 @@
+---
+title: "1. Revised architecture — one pipeline, split by kind"
+---
+flowchart LR
+  C["<b>Caller services</b><br/>other ITpipes<br/>backends"]
+  API["<b>API Gateway<br/>+ Lambda</b><br/>bytes never travel<br/>through the API"]
+
+  C -->|"POST /jobs<br/>+ idempotency key"| API
+  API -->|"202 + jobId<br/>GET /jobs/id"| C
+
+  subgraph IMP["IMPORTS — seconds to minutes"]
+    direction LR
+    QI[["imports queue<br/>visibility ≥<br/>deadline + grace"]]
+    WI["<b>Import fleet</b><br/>2 vCPU / 8 GB<br/><b>2 slots</b><br/>15-min deadline"]
+    DLQI[["imports<br/>DLQ"]]
+    QI -->|"jobId"| WI
+    QI -.->|"maxReceive 10"| DLQI
+  end
+
+  subgraph EXP["EXPORTS — tens of minutes"]
+    direction LR
+    QE[["exports queue<br/>visibility 125 min,<br/>heartbeat 60 s"]]
+    WE["<b>Export fleet</b><br/>2 vCPU / 8 GB<br/><b>1 slot</b><br/><b>200 GiB disk</b><br/>120-min deadline<br/>scale-in protected"]
+    DLQE[["exports<br/>DLQ"]]
+    QE -->|"jobId"| WE
+    QE -.->|"maxReceive 10"| DLQE
+  end
+
+  API -->|"send jobId only"| QI
+  API -->|"send jobId only"| QE
+
+  DDB[("<b>DynamoDB jobs</b><br/>single source of truth<br/>one conditional write<br/>per transition, on <b>version</b><br/>PITR · 90-day TTL")]
+  S3[("<b>S3 results</b><br/>imports/… kept 90 d<br/>exports/… expire 14 d<br/>abort multipart at 7 d")]
+
+  API -.->|"conditional create:<br/>queued"| DDB
+  WI -->|"claim ·<br/>publish"| DDB
+  WE -->|"claim ·<br/>publish"| DDB
+  WI -->|"per-attempt<br/><b>before</b> the record"| S3
+  WE -->|"multipart 10–40 GB<br/><b>before</b> the record"| S3
+
+  FAN["<b>Fan-out Lambda</b><br/>fans out and nothing<br/>else, so one bad<br/>endpoint cannot block<br/>the shard for 24 h"]
+  WQ[["webhook<br/>queue"]]
+  WH["<b>Delivery Lambda</b><br/>bounded retries<br/>S3 on-failure dest"]
+  CB["<b>Caller webhook</b><br/>dedupes on<br/>jobId + status"]
+
+  DDB -->|"stream, filtered to<br/>terminal transitions"| FAN
+  FAN --> WQ --> WH -->|"POST"| CB
+
+  SW["<b>Sweeper Lambda</b><br/>EventBridge, 1/min<br/>fails leases expired beyond any<br/>in-flight message · drains both DLQs<br/><i>this is what guarantees a terminal state</i>"]
+
+  DLQI -->|"drain"| SW
+  DLQE -->|"drain"| SW
+  SW -.->|"write failed"| DDB
+
+  classDef fleet fill:#ffe9a8,stroke:#a06a00,stroke-width:4px,color:#0b1b33
+  classDef store fill:#d5f2da,stroke:#1d6b2a,stroke-width:3px,color:#0b1b33
+  classDef queue fill:#ece0ff,stroke:#6b3fb0,stroke-width:2px,color:#0b1b33
+  classDef dlq fill:#ffdada,stroke:#b02020,stroke-width:2px,color:#0b1b33
+  classDef edge fill:#e6eeff,stroke:#2f4b7c,stroke-width:2px,color:#0b1b33
+  class WI,WE fleet
+  class DDB,S3 store
+  class QI,QE,WQ queue
+  class DLQI,DLQE dlq
+  class C,API,FAN,WH,CB,SW edge
