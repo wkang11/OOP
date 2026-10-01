@@ -1,7 +1,7 @@
 # Interview tomorrow — ITpipes conversion service
 
-**Tonight:** read §1–§5 once, out loud if you can.  
-**Morning:** read only §1 (the 2-minute opening) and the number table.  
+**Tonight:** read §1, **§1b**, and §3 out loud.  
+**Morning:** §1 (2-minute opening) + **§1b** (lease/version, timeout, canary) + the number table in §5.  
 **If they let you pick:** go deep on monitoring, not on more AWS services.
 
 This is a 60-minute design + code review. They will change the facts mid-session. They will spend a lot of time on “how do you run this in production.”
@@ -33,6 +33,81 @@ Then walk one import. Then say what is different for an export. Then volunteer h
 
 ---
 
+## 1b. The four things you asked about — say them this way
+
+These are the distinctions that kept coming up. If the room only gives you 10 minutes of code/ops, these four are the ones to land.
+
+### Lease vs version (you have this — keep the wording)
+
+> The **lease** stops us **doing** the work twice. The **version** stops us **recording** the work twice.
+
+- SQS can still have two notes for the same job. The lease does **not** delete the extra note.
+- A worker that sees `running` + a lease still in the future **does not start the converter**. It puts the note back and waits. That is the lease.
+- Every write to the DynamoDB row says “only if `version` is still what I read.” Only one write wins. That is version.
+- If clocks are wrong, we might convert twice. We still **publish once**. That is why a reviewer who says “your lease uses wall clocks, so two results can publish” is wrong — do not agree.
+
+Where in code (`src/handle.ts`):
+
+1. **Read lease** — if live, `retry` until it expires. Telemetry: `job.lease_held`.
+2. **Set lease** — on a successful claim, `now + deadline + 2 min grace`.
+3. **Clear lease** — on retry, success, or fail (`leaseExpiresAt: null`) so the next worker is not blocked.
+4. **Version** is the `expectedVersion` argument on every `store.update`. If it returns empty, we do not convert / we do not overwrite. Telemetry: `job.claim_conflict` or `job.stale_write_discarded`.
+
+Third piece if they keep going: each try writes a **different S3 key** (`attempts/1/…` vs `attempts/2/…`), so a slow upload cannot clobber the good zip.
+
+### Why a 30-second timeout fails almost every real job
+
+The work is longer than 30 seconds. Import = minutes. Export = tens of minutes. At 30 seconds, success rate on real files is about **zero**.
+
+```
+t=0s     start (needs ~3 min, or ~30 min for an export)
+t=30s    timer rejects → catch → retry, child NOT killed
+t=30s    second converter starts next to the first (two × 2 GB)
+t=~90s   receiveCount hits 3 → job marked failed
+```
+
+A good file looks like a bad file. That is why this ranked above “two workers overwrite”: there is no working system for the overwrite to damage.
+
+**Fix is not “remove the timeout.”** You still want one, or a hung Java process sits on 2 GB forever.
+
+1. Size it **above** real work: 15 min import, 120 min export. It bounds a hang, it does not enforce an SLO.
+2. Hide the SQS message at least that long (125 min for exports) and heartbeat every 60s.
+3. If it still fires: **kill and reap** the child, then retry. Next try must be alone.
+
+If they later say p99 import is 22 minutes: raise the deadline. Do not delete it. The alarm `job.deadline_exceeded` > ~1/hour means “this number no longer matches reality.”
+
+### Canary is not just CI/CD
+
+Two jobs:
+
+1. **Gate** — staging canary must pass before we promote. That part is CI/CD.
+2. **Heartbeat in production** — it keeps running forever, every 5 minutes, one tiny import + one tiny export.
+
+Other alarms watch **customer work**. At night the queues are empty and everything looks green even if API Gateway is down. The canary is fake customer traffic.
+
+**Silence is an outage.** Default CloudWatch treats missing data as healthy. If the thing that submits canaries dies, you have scored a total outage as green. Set `TreatMissingData: breaching`.
+
+It also catches what the ECS circuit breaker misses: a task that **starts** but fails every job.
+
+It does **not** catch a customer’s broken `.mdb`. Canary files are known-good.
+
+### What each TS file is (if they open the repo)
+
+Walk in this order:
+
+1. `src/legacy/original-handler.ts` — their starter, **unfixed**. 30s, no kill, last write wins.
+2. `src/handle.ts` — the worker you wrote. Claim, lease, version, deadline, kill, classify.
+3. `src/types.ts` — the seams (`JobStore`, `QueueMessage`, `Converter`, `Clock`). No AWS.
+4. `src/errors.ts` — exit 2 = permanent, 137 / deadline = retry, no code = one retry + own counter.
+5. `src/index.ts` — the numbers: 15 min, 120 min, 3 attempts, 2 min grace.
+6. `test/fakes.ts` — fake DB, queue, converter, clock. No real time.
+7. `test/original-handler.test.ts` — expects the **bugs**.
+8. `test/handle.test.ts` — expects the **fixes**. Same fakes, opposite assertions.
+
+`npm test` → 27 passed. No AWS.
+
+---
+
 ## 2. Words they will use (30 seconds each)
 
 You do not need to lecture these. You need them ready if someone says the word.
@@ -42,8 +117,8 @@ You do not need to lecture these. You need them ready if someone says the word.
 | **Job record** | The row in DynamoDB. It is the truth. Status is `queued`, `running`, `succeeded`, or `failed`. |
 | **Queue message** | A sticky note that only says `{jobId}`. It is **not** the truth. If the note and the row disagree, believe the row. |
 | **Claim** | A worker saying “this job is mine now.” It works only if no one else has claimed it. |
-| **Version** | A number on the row. Every write must say “I last saw version 4.” If the row is already 5, your write is thrown away. That is how two workers cannot both publish. |
-| **Lease** | A timestamp: “I own this job until 3:17.” A second worker that sees a live lease puts the note back and does nothing. |
+| **Version** | Number on the row. Write only if it still matches. **Records one winner.** See §1b. |
+| **Lease** | “I own this until 3:17.” Second worker does **not** start converting. **Does not delete the extra SQS note.** See §1b. |
 | **Visibility timeout** | How long SQS hides a message after a worker picks it up. If the worker dies, the message reappears after this time. For exports I set it to 125 minutes so a 120-minute job is not stolen mid-run. |
 | **Heartbeat** | Every 60 seconds the worker tells SQS “still working, keep hiding the message.” |
 | **Ack** | Delete the message. The work is done (or we have given up). |
@@ -68,7 +143,7 @@ Say each step in one sentence. The “why” is only if they stop you.
 1. **Caller submits.** `POST /jobs` with the file’s S3 key and an idempotency key (“if I send this twice, it is the same job”).
 2. **API writes the row.** DynamoDB, status `queued`. The idempotency key **is the row’s key**, not a search. Searching an index can miss a write that just happened, and two clicks would create two jobs.
 3. **API drops a note** on the imports queue: only `{jobId}`. Returns `202` + the id.
-4. **A worker picks up the note**, reads the row (a fresh read, not a cached one), and **claims** it: status `running`, attempt + 1, lease set, version must still match. If the version does not match, someone else already has it — put the note back, do not convert.
+4. **A worker picks up the note**, reads the row (a fresh read). **Lease first:** if someone is still converting, put the note back — do not start a second process. **Then claim with version:** set `running`, attempt+1, new lease, **only if version still matches**. If version lost, someone else already has it — put the note back, do not convert.
 5. **Convert**, 15-minute deadline, in the same process (TypeScript library).
 6. **Write the JSON to S3 first**, at `imports/{id}/attempts/{n}/result.json`.
 7. **Then mark the row `succeeded`**, pointing at that file. Same version check. If we lost the race, throw our result away. The good file is already safe under a different key.
@@ -108,7 +183,7 @@ One CDK app in the same repo as the code: queues, tables, machines, alarms. An a
 
 1. Pull request: typecheck, tests, `cdk diff`.
 2. Merge: build **one** image, tag it with the git commit, scan it, push it.
-3. Staging. Every 5 minutes a canary import + export must pass.
+3. Staging. Every 5 minutes a canary import + export must pass. **The canary also keeps running in production** — it is fake customer traffic, not only a pipeline gate. If it goes **silent**, that is the outage (`TreatMissingData: breaching`). See §1b.
 4. Production: rolling deploy of **that same image**, one fleet at a time, **imports first** (blast radius is minutes, not tens of minutes).
 
 **A bad release looks like:** canary red, or “our” failures (not the customer’s bad files) jump on the new image tag, or new tasks will not start.
